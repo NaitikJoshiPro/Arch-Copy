@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Colors for messages
+C0="\033[0m"; C1="\033[1;32m"; C2="\033[1;31m"
+
+echo -e "${C1}=== USB GRUB Repair Utility ===${C0}"
+
+# ---- Locate removable drives ----
+echo "Scanning for removable drives..."
+lsblk -o NAME,SIZE,RM,TYPE,MOUNTPOINT | grep -E 'disk|part'
+
+# Pick the USB device
+read -rp "Enter your USB device path (e.g. /dev/sdb): " DEV
+[[ -b $DEV ]] || { echo -e "${C2}Device not found${C0}"; exit 1; }
+
+# Confirm it's removable
+RM=$(lsblk -ndo RM "$DEV")
+if [[ $RM -ne 1 ]]; then
+  echo -e "${C2}Warning: $DEV is not marked removable.${C0}"
+  read -rp "Continue anyway? (y/N) " yn
+  [[ $yn == [Yy]* ]] || exit 1
+fi
+
+# Find partitions
+ROOT_PART=$(lsblk -lnpo NAME,PARTLABEL,TYPE "$DEV" | awk '/part/ && !/EFI/ {print $1}' | head -n1)
+BOOT_PART=$(lsblk -lnpo NAME,PARTLABEL,TYPE "$DEV" | awk '/part/ && /EFI/ {print $1}' | head -n1)
+
+if [[ -z $ROOT_PART || -z $BOOT_PART ]]; then
+  echo -e "${C2}Could not auto-detect root or EFI partition.${C0}"
+  read -rp "Enter root partition (e.g. ${DEV}2): " ROOT_PART
+  read -rp "Enter EFI partition (e.g. ${DEV}1): " BOOT_PART
+fi
+
+echo -e "${C1}Using root:${C0} $ROOT_PART"
+echo -e "${C1}Using EFI :${C0} $BOOT_PART"
+read -rp "Proceed to mount and reinstall GRUB? (y/N) " yn
+[[ $yn == [Yy]* ]] || exit 1
+
+# ---- Mount the target ----
+mount "$ROOT_PART" /mnt
+mkdir -p /mnt/boot
+mount "$BOOT_PART" /mnt/boot
+
+for d in dev proc sys run; do
+  mount --bind "/$d" "/mnt/$d"
+done
+
+echo -e "${C1}Entering chroot and reinstalling GRUB...${C0}"
+
+chroot /mnt /bin/bash -eux <<'CHROOT'
+# inside chroot
+if [ -d /sys/firmware/efi ]; then
+  echo "UEFI detected -> installing GRUB (UEFI)"
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --recheck --removable
+else
+  echo "No /sys/firmware/efi -> installing GRUB (BIOS)"
+  grub-install --target=i386-pc /dev/sdX   # will be replaced below
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+CHROOT
+
+# Replace placeholder /dev/sdX with actual DEV for BIOS install
+sed -i "s|/dev/sdX|$DEV|g" /mnt/root/.bash_history 2>/dev/null || true
+
+echo -e "${C1}Cleaning up mounts...${C0}"
+for d in run sys proc dev boot; do
+  umount -R /mnt/$d 2>/dev/null || true
+done
+umount /mnt || true
+sync
+
+echo -e "${C1}GRUB reinstall complete. USB should now be bootable.${C0}"
